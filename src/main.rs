@@ -1,19 +1,16 @@
 mod vm;
 
 fn main() {
-    let instructions = [0x67c9];
-    let global_mem = [4];
+    let mut instructions = [
+        0x00001537 as u32,
+        0x00000593,
+        0x00B50663,
+        0xFFF50513,
+        0xFF9FF06F,
+        0x0000006F,
+    ];
 
-    let entry = global_mem.len() * 4;
-
-    let mut memory: Vec<u32> = vec![];
-    memory.extend_from_slice(&global_mem);
-    memory.extend_from_slice(&instructions);
-
-    let mut vm = vm::Vm::new(
-        bytemuck::cast_slice_mut(memory.as_mut_slice()),
-        entry as u32,
-    );
+    let mut vm = vm::Vm::new(bytemuck::cast_slice_mut(&mut instructions), 0);
 
     vm.run().unwrap();
 }

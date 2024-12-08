@@ -56,11 +56,8 @@ struct UJtype {
     imm: u32,
 }
 const fn sign_extend(value: u32, sign_bit: u32) -> u32 {
-    if value & (1 << sign_bit) != 0 {
-        value | !((1 << (sign_bit + 1)) - 1)
-    } else {
-        value
-    }
+    let shamt = 31 - sign_bit;
+    ((value as i32) << shamt >> shamt) as u32
 }
 fn rtype(instruction: u32) -> Rtype {
     Rtype {
@@ -123,13 +120,16 @@ fn utype(instruction: u32) -> Utype {
 fn ujtype(instruction: u32) -> UJtype {
     UJtype {
         rd: (instruction >> 7) & 0b11111,
-        imm: sign_extend(
-            ((instruction >> 12) & 0b11111111) << 12
-                | ((instruction >> 20) & 1) << 11
-                | ((instruction >> 21) & 0b1111111111) << 1
-                | (instruction >> 31) << 20,
-            20,
-        ),
+        imm: {
+            let raw_imm = instruction >> 12;
+            sign_extend(
+                (raw_imm & 0b11111111) << 12
+                    | (raw_imm >> 8 & 0b1) << 11
+                    | (raw_imm >> 9 & 0b1111111111) << 1
+                    | (raw_imm >> 19 & 0b1) << 20,
+                20,
+            )
+        },
     }
 }
 pub struct Vm<'a> {
@@ -158,7 +158,7 @@ impl<'a> Vm<'a> {
         self.registers[index as usize - 1]
     }
     pub fn run(&mut self) -> Result<(), Error> {
-        while self.memory.len() <= self.pc as usize + size_of::<u32>() {
+        while self.memory.len() >= self.pc as usize + size_of::<u32>() {
             let instruction = unsafe {
                 self.memory
                     .as_ptr()
@@ -170,9 +170,10 @@ impl<'a> Vm<'a> {
             if instruction & 0b11 != 0b11 {
                 return Err(Error::CompressedInstruction);
             }
+            let oldpc = self.pc;
             self.pc += size_of::<u32>() as u32;
 
-            let opcode = (instruction >> 2) & 0b11_1111;
+            let opcode = (instruction >> 2) & 0b11_111;
             match opcode {
                 LOAD => {
                     let Itype {
@@ -244,8 +245,8 @@ impl<'a> Vm<'a> {
                 }
                 JAL => {
                     let UJtype { rd, imm } = ujtype(instruction);
-                    self.set_reg(rd, self.pc + 4);
-                    self.pc = self.pc.wrapping_add(imm);
+                    self.set_reg(rd, self.pc);
+                    self.pc = oldpc.wrapping_add(imm);
 
                     println!("jal pc <- {:x}; r{} <- {:x}", self.pc, rd, self.get_reg(rd));
                 }
@@ -257,7 +258,7 @@ impl<'a> Vm<'a> {
                         imm,
                     } = itype(instruction);
 
-                    self.set_reg(rd, self.pc + 4);
+                    self.set_reg(rd, self.pc);
                     self.pc = self.get_reg(rs1).wrapping_add(imm as u32);
 
                     if funct3 != 0b000 {
@@ -270,7 +271,76 @@ impl<'a> Vm<'a> {
                         self.get_reg(rd)
                     );
                 }
-                _ => return Err(Error::InvalidOpcode(instruction)),
+                BRANCH => {
+                    let SBtype {
+                        rs1,
+                        rs2,
+                        imm,
+                        funct3,
+                    } = sbtype(instruction);
+                    // 0 - eq, 1 - less than
+                    let v1 = self.get_reg(rs1) as i32;
+                    let v2 = self.get_reg(rs2) as i32;
+                    let result = match funct3 {
+                        FUNCT_BEQ => v1 == v2,
+                        FUNCT_BNE => v1 != v2,
+                        FUNCT_BLT => v1 < v2,
+                        FUNCT_BGE => v1 >= v2,
+                        FUNCT_BLTU => (v1 as u32) < (v2 as u32),
+                        FUNCT_BGEU => (v1 as u32) >= (v2 as u32),
+                        _ => return Err(Error::InvalidFunct(funct3)),
+                    };
+                    if result {
+                        self.pc = oldpc.wrapping_add(imm);
+                    }
+
+                    println!(
+                        "branch {:b} pc <- {}; result <- {}",
+                        funct3, self.pc, result,
+                    );
+                }
+                OP_IMM => {
+                    let Itype {
+                        rs1,
+                        rd,
+                        funct3,
+                        imm,
+                    } = itype(instruction);
+                    let value = self.get_reg(rs1);
+                    let result = match funct3 {
+                        FUNCT_ADDI => value.wrapping_add(imm),
+                        FUNCT_SLTI => {
+                            if (value as i32) < (imm as i32) {
+                                1
+                            } else {
+                                0
+                            }
+                        }
+                        FUNCT_SLTIU => {
+                            if value < imm {
+                                1
+                            } else {
+                                0
+                            }
+                        }
+                        FUNCT_XORI => value ^ imm,
+                        FUNCT_ORI => value | imm,
+                        FUNCT_ANDI => value & imm,
+                        FUNCT_SLLI => value << (imm & 0b11111),
+                        FUNCT_SRLI => {
+                            if (imm & SRAI_MASK) == 0 {
+                                value >> (imm & 0b11111)
+                            } else {
+                                ((value as i32) >> (imm & 0b11111)) as u32
+                            }
+                        }
+                        _ => return Err(Error::InvalidFunct(funct3)),
+                    };
+
+                    self.set_reg(rd, result);
+                    println!("op_imm {:b} r{} <- {}", funct3, rd, self.get_reg(rd));
+                }
+                _ => return Err(Error::InvalidOpcode(opcode)),
             }
         }
 
@@ -287,6 +357,24 @@ const FUNCT_LHU: u32 = 0b101;
 const FUNCT_SB: u32 = 0b000;
 const FUNCT_SH: u32 = 0b001;
 const FUNCT_SW: u32 = 0b010;
+
+const FUNCT_BEQ: u32 = 0b000;
+const FUNCT_BNE: u32 = 0b001;
+const FUNCT_BLT: u32 = 0b100;
+const FUNCT_BGE: u32 = 0b101;
+const FUNCT_BLTU: u32 = 0b110;
+const FUNCT_BGEU: u32 = 0b111;
+
+const FUNCT_ADDI: u32 = 0b000;
+const FUNCT_SLTI: u32 = 0b010;
+const FUNCT_SLTIU: u32 = 0b011;
+const FUNCT_XORI: u32 = 0b100;
+const FUNCT_ORI: u32 = 0b110;
+const FUNCT_ANDI: u32 = 0b111;
+
+const FUNCT_SLLI: u32 = 0b001;
+const FUNCT_SRLI: u32 = 0b101;
+const SRAI_MASK: u32 = 1 << 10;
 
 const LOAD: u32 = 0b00_000;
 const LOAD_FP: u32 = 0b00_001;
